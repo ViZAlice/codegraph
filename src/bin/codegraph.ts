@@ -53,6 +53,7 @@ import { relaunchWithWasmRuntimeFlagsIfNeeded } from '../extraction/wasm-runtime
 import { installCommandSupervision } from './command-supervision';
 import { EXTRACTION_VERSION } from '../extraction/extraction-version';
 import { getTelemetry, TELEMETRY_DOCS, recordIndexEvent } from '../telemetry';
+import { wrapPromptHookOutput } from '../prompt-hook-output';
 
 // Decided once, before `--color`/`--no-color` are stripped from argv below
 // (#1281). Piped/redirected stdout, NO_COLOR, or --no-color -> plain output.
@@ -1219,21 +1220,36 @@ program
 /**
  * codegraph prompt-hook  (hidden)
  *
- * A Claude Code `UserPromptSubmit` hook entry point. Reads `{prompt, cwd}` JSON
- * on stdin; for a structural/flow/impact prompt it runs `codegraph_explore` on
- * the indexed project and prints the result to stdout, which Claude injects into
- * the agent's context — so the agent's reflex grep/read has nothing left to find
- * and reliably uses CodeGraph (the adoption problem). Installed by the installer
- * into Claude's settings.json (opt-in, default-yes).
+ * A `UserPromptSubmit` hook entry point (Claude Code, ZCode). Reads
+ * `{prompt, cwd}` JSON on stdin; for a structural/flow/impact prompt it runs
+ * `codegraph_explore` on the indexed project and prints the result to stdout,
+ * which the client injects into the agent's context — so the agent's reflex
+ * grep/read has nothing left to find and reliably uses CodeGraph (the
+ * adoption problem). Installed by the installer into Claude's settings.json
+ * (opt-in, default-yes) and ZCode's config.json (user scope only).
+ *
+ * `--context-json` adapts the OUTPUT for clients that parse hook stdout as
+ * strict JSON (ZCode): every line this command prints is wrapped in the
+ * `hookSpecificOutput` UserPromptSubmit envelope instead of going out raw
+ * (Claude Code injects raw stdout and omits the flag).
  *
  * LOAD-BEARING: this must NEVER break the user's prompt. Every failure path —
  * kill-switch, non-structural prompt, no index, engine error — exits 0 with no
- * output. The only effect is additive context when it can confidently provide it.
+ * output (an empty stdout is legal for both clients). The only effect is
+ * additive context when it can confidently provide it.
  */
 program
   .command('prompt-hook', { hidden: true })
-  .description('Claude UserPromptSubmit hook: inject CodeGraph context for structural prompts (reads {prompt,cwd} JSON on stdin)')
-  .action(async () => {
+  .description('UserPromptSubmit hook: inject CodeGraph context for structural prompts (reads {prompt,cwd} JSON on stdin)')
+  .option('--context-json', 'Wrap output in a UserPromptSubmit hookSpecificOutput envelope for hook clients that parse stdout as strict JSON (e.g. ZCode)')
+  .action(async (options: { contextJson?: boolean }) => {
+    // Single egress for everything this hook prints. Without --context-json
+    // the text goes out verbatim (Claude Code injects raw stdout); with it,
+    // the text is wrapped in the strict-JSON envelope ZCode requires — its
+    // non-JSON output is logged and dropped, never injected.
+    const emit = (text: string): void => {
+      process.stdout.write(wrapPromptHookOutput(text, options.contextJson === true));
+    };
     try {
       // Kill-switch: lets a user disable the nudge without uninstalling /
       // editing settings.json (CI, low-power machines, personal preference).
@@ -1319,7 +1335,7 @@ program
               const more = plan.viaSubScan
                 ? `call codegraph_explore with projectPath: "${plan.exploreRoot}" for more`
                 : 'call codegraph_explore for more';
-              process.stdout.write(
+              emit(
                 `<codegraph_context note="Structural context from CodeGraph for this prompt — treat returned source as already read; ${more}.">\n${body}${others}\n</codegraph_context>\n`,
               );
               gate(keyworded ? 'high-keyword' : 'high-token');
@@ -1354,7 +1370,7 @@ program
             .join('\n');
           const exampleQuery = related.slice(0, 3).map((m) => m.name).join(' ');
           const projectHint = plan.viaSubScan ? ` with projectPath: "${plan.exploreRoot}"` : '';
-          process.stdout.write(
+          emit(
             `<codegraph_context note="CodeGraph found indexed symbols matching this prompt — query the graph before searching files.">\n` +
             `This project's CodeGraph index contains symbols matching this request:\n${lines}\n` +
             `Call codegraph_explore ONCE${projectHint} with the relevant names in one query (e.g. "${exampleQuery}") ` +
@@ -1368,7 +1384,7 @@ program
       } else {
         // Several indexed sub-projects, none a clear match — don't guess; tell
         // the agent they exist and how to query one.
-        process.stdout.write(
+        emit(
           `<codegraph_context note="CodeGraph is available for this workspace's indexed sub-projects — query one by passing projectPath to codegraph_explore.">\n` +
           nudge(plan.nudgeProjects, "This workspace's CodeGraph indexes live in sub-projects. To use CodeGraph, call codegraph_explore with the projectPath of the relevant one:") +
           `</codegraph_context>\n`,
@@ -2246,7 +2262,7 @@ program
  */
 program
   .command('install')
-  .description('Install codegraph MCP server into one or more agents (Claude Code, Cursor, Codex CLI, opencode, Hermes Agent, Gemini CLI, Antigravity IDE, Kiro, GitHub Copilot)')
+  .description('Install codegraph MCP server into one or more agents (Claude Code, Cursor, Codex CLI, opencode, Hermes Agent, Gemini CLI, Antigravity IDE, Kiro, GitHub Copilot, ZCode)')
   .option('-t, --target <ids>', 'Target agent(s): comma-separated ids, or "auto"|"all"|"none". Default: prompt')
   .option('-l, --location <where>', 'Install location: "global" or "local". Default: prompt')
   .option('-y, --yes', 'Non-interactive: defaults to --location=global --target=auto, auto-allow on')

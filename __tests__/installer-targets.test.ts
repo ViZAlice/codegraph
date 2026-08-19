@@ -23,6 +23,8 @@ import { ALL_TARGETS, getTarget, resolveTargetFlag } from '../src/installer/targ
 import { uninstallTargets, refreshTargets } from '../src/installer';
 import { upsertTomlTable, removeTomlTable, buildTomlTable } from '../src/installer/targets/toml';
 import { cleanupLegacyHooks, writePromptHookEntry, removePromptHookEntry } from '../src/installer/targets/claude';
+import { resolveZcodeMcpCommand, resolveZcodeCliEntry } from '../src/installer/targets/zcode';
+import { wrapPromptHookOutput } from '../src/prompt-hook-output';
 
 function mkTmpDir(label: string): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), `cg-targets-${label}-`));
@@ -146,6 +148,11 @@ describe('Installer targets — contract', () => {
               delete seed.mcpServers;
               seed.servers = { other: { command: 'x' } };
             }
+            // ZCode uses the nested `mcp.servers` (not top-level `mcpServers`).
+            if (target.id === 'zcode') {
+              delete seed.mcpServers;
+              seed.mcp = { servers: { other: { command: 'x' } } };
+            }
             fs.writeFileSync(jsonPath, JSON.stringify(seed, null, 2) + '\n');
 
             target.install(location, { autoAllow: true });
@@ -157,6 +164,9 @@ describe('Installer targets — contract', () => {
             } else if (target.id === 'copilot-vscode' || target.id === 'copilot-jetbrains') {
               expect(after.servers.other).toBeDefined();
               expect(after.servers.codegraph).toBeDefined();
+            } else if (target.id === 'zcode') {
+              expect(after.mcp.servers.other).toBeDefined();
+              expect(after.mcp.servers.codegraph).toBeDefined();
             } else {
               expect(after.mcpServers.other).toBeDefined();
               expect(after.mcpServers.codegraph).toBeDefined();
@@ -2443,5 +2453,652 @@ describe('Installer targets — Copilot family', () => {
     expect(cli.detect('global').alreadyConfigured).toBe(false);
     expect(vscode.detect('global').alreadyConfigured).toBe(true);
     expect(jetbrains.detect('global').alreadyConfigured).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ZCode — nested `mcp.servers.codegraph` key, dual-scope, never-delete
+// config.json (D2), read-only local fallbacks (D3), and win32 command
+// resolution (D1). The registry-driven contract suite above already covers
+// the shared surface (install/idempotency/sibling/uninstall/printConfig) for
+// the nested-shape special case; these pin the ZCode-specific behavior.
+// ---------------------------------------------------------------------------
+describe('Installer targets — ZCode', () => {
+  let tmpHome: string;
+  let tmpCwd: string;
+  let origCwd: string;
+  let homeRestore: { restore: () => void };
+
+  beforeEach(() => {
+    tmpHome = mkTmpDir('zc-home');
+    tmpCwd = mkTmpDir('zc-cwd');
+    origCwd = process.cwd();
+    process.chdir(tmpCwd);
+    homeRestore = setHome(tmpHome);
+  });
+
+  afterEach(() => {
+    homeRestore.restore();
+    process.chdir(origCwd);
+    fs.rmSync(tmpHome, { recursive: true, force: true });
+    fs.rmSync(tmpCwd, { recursive: true, force: true });
+  });
+
+  it('first install writes ~/.zcode/cli/config.json (nested mcp.servers.codegraph) + ~/.zcode/AGENTS.md; re-run all unchanged', () => {
+    const zcode = getTarget('zcode')!;
+    const result = zcode.install('global', { autoAllow: true });
+
+    const cfgFile = path.join(tmpHome, '.zcode', 'cli', 'config.json');
+    const agentsMd = path.join(tmpHome, '.zcode', 'AGENTS.md');
+    expect(result.files.some((f) => f.path === cfgFile)).toBe(true);
+    expect(result.files.some((f) => f.path === agentsMd)).toBe(true);
+    expect(fs.existsSync(agentsMd)).toBe(true);
+    expect(fs.readFileSync(agentsMd, 'utf-8')).toContain('codegraph explore');
+
+    const cfg = JSON.parse(fs.readFileSync(cfgFile, 'utf-8'));
+    // Nested `mcp.servers.codegraph`, NOT the Claude/Cursor top-level `mcpServers`.
+    expect(cfg.mcpServers).toBeUndefined();
+    expect(cfg.mcp.servers.codegraph.type).toBe('stdio');
+    expect(cfg.mcp.servers.codegraph.args).toEqual(['serve', '--mcp']);
+    // D5 — no `enabled` field.
+    expect(cfg.mcp.servers.codegraph.enabled).toBeUndefined();
+    // Restart note.
+    expect(result.notes?.join(' ')).toMatch(/Restart ZCode/);
+
+    const second = zcode.install('global', { autoAllow: true });
+    for (const f of second.files) expect(f.action).toBe('unchanged');
+  });
+
+  it('install preserves sibling servers + unrelated top-level keys; uninstall keeps them intact and never deletes the file (D2)', () => {
+    const zcode = getTarget('zcode')!;
+    const cfgFile = path.join(tmpHome, '.zcode', 'cli', 'config.json');
+    fs.mkdirSync(path.dirname(cfgFile), { recursive: true });
+    fs.writeFileSync(cfgFile, JSON.stringify({
+      plugins: { some: { source: 'marketplace' } },
+      mcp: {
+        servers: {
+          godot: { type: 'stdio', command: 'godot-mcp', args: [] },
+        },
+      },
+    }, null, 2) + '\n');
+
+    zcode.install('global', { autoAllow: true });
+
+    const after = JSON.parse(fs.readFileSync(cfgFile, 'utf-8'));
+    expect(after.plugins.some.source).toBe('marketplace');
+    expect(after.mcp.servers.godot.command).toBe('godot-mcp');
+    expect(after.mcp.servers.codegraph).toBeDefined();
+
+    zcode.uninstall('global');
+
+    const afterUninstall = JSON.parse(fs.readFileSync(cfgFile, 'utf-8'));
+    expect(afterUninstall.plugins.some.source).toBe('marketplace');
+    expect(afterUninstall.mcp.servers.godot.command).toBe('godot-mcp');
+    expect(afterUninstall.mcp.servers.codegraph).toBeUndefined();
+    expect(fs.existsSync(cfgFile)).toBe(true);
+  });
+
+  it('uninstall prunes emptied mcp.servers and mcp containers but never deletes config.json', () => {
+    const zcode = getTarget('zcode')!;
+    const cfgFile = path.join(tmpHome, '.zcode', 'cli', 'config.json');
+
+    // From-scratch install leaves only the codegraph entry.
+    zcode.install('global', { autoAllow: true });
+    zcode.uninstall('global');
+
+    expect(fs.existsSync(cfgFile)).toBe(true);
+    const after = JSON.parse(fs.readFileSync(cfgFile, 'utf-8'));
+    expect(after.mcp).toBeUndefined();
+    expect(after).toEqual({});
+  });
+
+  it('install keeps user content in AGENTS.md; uninstall strips only the marker block', () => {
+    const zcode = getTarget('zcode')!;
+    const agentsMd = path.join(tmpHome, '.zcode', 'AGENTS.md');
+    fs.mkdirSync(path.dirname(agentsMd), { recursive: true });
+    fs.writeFileSync(agentsMd, `# My zcode notes\n\nBe terse.\n\n${LEGACY_BLOCK}\n`);
+
+    zcode.install('global', { autoAllow: true });
+
+    let body = fs.readFileSync(agentsMd, 'utf-8');
+    expect(body).toContain('# My zcode notes');
+    expect(body).toContain('Be terse.');
+    expect(body).not.toContain('Prefer `codegraph_search`');
+    expect(body).toContain('codegraph explore');
+
+    zcode.uninstall('global');
+
+    body = fs.readFileSync(agentsMd, 'utf-8');
+    expect(body).toContain('# My zcode notes');
+    expect(body).toContain('Be terse.');
+    expect(body).not.toContain('CODEGRAPH_START');
+    expect(body).not.toContain('codegraph explore');
+  });
+
+  it('local install writes ./.zcode/config.json and ./AGENTS.md', () => {
+    const zcode = getTarget('zcode')!;
+    const result = zcode.install('local', { autoAllow: true });
+    const paths = result.files.map((f) => f.path.replace(/\\/g, '/'));
+    expect(paths.some((p) => p.endsWith('/.zcode/config.json'))).toBe(true);
+    expect(paths.some((p) => p.endsWith('/AGENTS.md'))).toBe(true);
+    expect(fs.existsSync(path.join(process.cwd(), 'AGENTS.md'))).toBe(true);
+
+    const cfg = JSON.parse(fs.readFileSync(path.join(process.cwd(), '.zcode', 'config.json'), 'utf-8'));
+    expect(cfg.mcp.servers.codegraph).toBeDefined();
+  });
+
+  it('detect reads local read-only fallbacks ./zcode.json and ./.agents/mcp.json (top-level mcpServers, D3)', () => {
+    const zcode = getTarget('zcode')!;
+    expect(zcode.detect('local').alreadyConfigured).toBe(false);
+
+    // Fallback 1: ./zcode.json with top-level mcpServers.
+    fs.writeFileSync(path.join(tmpCwd, 'zcode.json'), JSON.stringify({
+      mcpServers: { codegraph: { command: 'codegraph', args: ['serve', '--mcp'] } },
+    }, null, 2) + '\n');
+    expect(zcode.detect('local').alreadyConfigured).toBe(true);
+
+    // Fallback 2: ./.agents/mcp.json with top-level mcpServers.
+    fs.rmSync(path.join(tmpCwd, 'zcode.json'));
+    expect(zcode.detect('local').alreadyConfigured).toBe(false);
+    fs.mkdirSync(path.join(tmpCwd, '.agents'), { recursive: true });
+    fs.writeFileSync(path.join(tmpCwd, '.agents', 'mcp.json'), JSON.stringify({
+      mcpServers: { codegraph: { command: 'codegraph' } },
+    }, null, 2) + '\n');
+    expect(zcode.detect('local').alreadyConfigured).toBe(true);
+  });
+
+  it('detect global falls back to ~/.agents/mcp.json when the .zcode config has no codegraph entry', () => {
+    const zcode = getTarget('zcode')!;
+    expect(zcode.detect('global').alreadyConfigured).toBe(false);
+
+    // No ~/.zcode/cli/config.json at all, but the user-level
+    // ~/.agents/mcp.json wires codegraph (top-level mcpServers).
+    fs.mkdirSync(path.join(tmpHome, '.agents'), { recursive: true });
+    fs.writeFileSync(path.join(tmpHome, '.agents', 'mcp.json'), JSON.stringify({
+      mcpServers: { codegraph: { command: 'codegraph', args: ['serve', '--mcp'] } },
+    }, null, 2) + '\n');
+    expect(zcode.detect('global').alreadyConfigured).toBe(true);
+
+    // A .zcode config that exists but holds NO codegraph entry must not
+    // shadow the fallback into silence either.
+    fs.mkdirSync(path.join(tmpHome, '.zcode', 'cli'), { recursive: true });
+    fs.writeFileSync(path.join(tmpHome, '.zcode', 'cli', 'config.json'), JSON.stringify({
+      mcp: { servers: { other: { command: 'x' } } },
+    }, null, 2) + '\n');
+    expect(zcode.detect('global').alreadyConfigured).toBe(true);
+
+    // …while a fallback without a codegraph entry keeps detect honest.
+    fs.writeFileSync(path.join(tmpHome, '.agents', 'mcp.json'), JSON.stringify({
+      mcpServers: { other: { command: 'x' } },
+    }, null, 2) + '\n');
+    expect(zcode.detect('global').alreadyConfigured).toBe(false);
+  });
+
+  it('global install warns that writing .zcode/cli/config.json shadows servers in ~/.agents/mcp.json', () => {
+    const zcode = getTarget('zcode')!;
+    // The user relies on ~/.agents/mcp.json servers; the .zcode config has
+    // no mcp.servers yet (file absent here), so this install is about to
+    // create the first one — shadowing their existing servers.
+    fs.mkdirSync(path.join(tmpHome, '.agents'), { recursive: true });
+    fs.writeFileSync(path.join(tmpHome, '.agents', 'mcp.json'), JSON.stringify({
+      mcpServers: { other: { command: 'x' } },
+    }, null, 2) + '\n');
+
+    const result = zcode.install('global', { autoAllow: true });
+
+    expect(result.notes?.join('\n')).toMatch(/~\/\.agents\/mcp\.json/);
+    expect(result.notes?.join('\n')).toMatch(/ignore servers/);
+    expect(result.notes?.join('\n')).toMatch(/takes precedence/);
+    // The install itself still went through.
+    const cfg = JSON.parse(fs.readFileSync(path.join(tmpHome, '.zcode', 'cli', 'config.json'), 'utf-8'));
+    expect(cfg.mcp.servers.codegraph).toBeDefined();
+  });
+
+  it('global install emits no shadowing note when mcp.servers is already populated', () => {
+    const zcode = getTarget('zcode')!;
+    // ~/.agents/mcp.json carries servers, BUT ~/.zcode/cli/config.json
+    // already has its own mcp.servers — the shadowing already happened
+    // (or the user moved on), no note.
+    fs.mkdirSync(path.join(tmpHome, '.agents'), { recursive: true });
+    fs.writeFileSync(path.join(tmpHome, '.agents', 'mcp.json'), JSON.stringify({
+      mcpServers: { other: { command: 'x' } },
+    }, null, 2) + '\n');
+    const cfgFile = path.join(tmpHome, '.zcode', 'cli', 'config.json');
+    fs.mkdirSync(path.dirname(cfgFile), { recursive: true });
+    fs.writeFileSync(cfgFile, JSON.stringify({
+      mcp: { servers: { sibling: { type: 'stdio', command: 'sib', args: [] } } },
+    }, null, 2) + '\n');
+
+    const result = zcode.install('global', { autoAllow: true });
+    expect(result.notes?.join('\n')).not.toMatch(/~\/\.agents\/mcp\.json/);
+    // And a re-run over our own entry is equally quiet.
+    const second = zcode.install('global', { autoAllow: true });
+    expect(second.notes?.join('\n')).not.toMatch(/~\/\.agents\/mcp\.json/);
+  });
+
+  it('global install emits no shadowing note when ~/.agents/mcp.json is absent or holds no servers', () => {
+    const zcode = getTarget('zcode')!;
+
+    // Fresh machine: no ~/.agents/mcp.json at all.
+    const first = zcode.install('global', { autoAllow: true });
+    expect(first.notes?.join('\n')).not.toMatch(/~\/\.agents\/mcp\.json/);
+
+    // An ~/.agents/mcp.json whose mcpServers map is empty is no reliance
+    // signal either. Reset .zcode mcp.servers first (uninstall leaves the
+    // file as `{}`), then plant the empty fallback file.
+    zcode.uninstall('global');
+    fs.mkdirSync(path.join(tmpHome, '.agents'), { recursive: true });
+    fs.writeFileSync(path.join(tmpHome, '.agents', 'mcp.json'), JSON.stringify({
+      mcpServers: {},
+    }, null, 2) + '\n');
+
+    const second = zcode.install('global', { autoAllow: true });
+    expect(second.notes?.join('\n')).not.toMatch(/~\/\.agents\/mcp\.json/);
+  });
+
+  // ---- enabled preservation on the codegraph entry (reinstall must not
+  // clobber a user's manual disable) ----
+  it('re-install preserves a user-set enabled:false and reports unchanged', () => {
+    const zcode = getTarget('zcode')!;
+    zcode.install('global', { autoAllow: true });
+    const cfgFile = path.join(tmpHome, '.zcode', 'cli', 'config.json');
+
+    // The user manually disabled the server in ZCode.
+    const cfg = JSON.parse(fs.readFileSync(cfgFile, 'utf-8'));
+    cfg.mcp.servers.codegraph.enabled = false;
+    fs.writeFileSync(cfgFile, JSON.stringify(cfg, null, 2) + '\n');
+
+    const second = zcode.install('global', { autoAllow: true });
+    expect(second.files.find((f) => f.path === cfgFile)?.action).toBe('unchanged');
+
+    const after = JSON.parse(fs.readFileSync(cfgFile, 'utf-8'));
+    expect(after.mcp.servers.codegraph.enabled).toBe(false);
+  });
+
+  it('self-heal of a stale command preserves a user-set enabled:false through the rewrite', () => {
+    const zcode = getTarget('zcode')!;
+    const cfgFile = path.join(tmpHome, '.zcode', 'cli', 'config.json');
+    fs.mkdirSync(path.dirname(cfgFile), { recursive: true });
+    fs.writeFileSync(cfgFile, JSON.stringify({
+      mcp: { servers: { codegraph: {
+        type: 'stdio',
+        command: 'C:/old/location/codegraph.cmd',
+        args: ['serve', '--mcp'],
+        enabled: false,
+      } } },
+    }, null, 2) + '\n');
+
+    const result = zcode.install('global', { autoAllow: true });
+
+    expect(result.files.find((f) => f.path === cfgFile)?.action).toBe('updated');
+    const after = JSON.parse(fs.readFileSync(cfgFile, 'utf-8'));
+    // The command self-healed to the current resolution…
+    expect(after.mcp.servers.codegraph.command).toBe(resolveZcodeMcpCommand());
+    // …while the manual disable survived the rewrite…
+    expect(after.mcp.servers.codegraph.enabled).toBe(false);
+    // …and the preserved state makes the next run idempotent again.
+    const third = zcode.install('global', { autoAllow: true });
+    expect(third.files.find((f) => f.path === cfgFile)?.action).toBe('unchanged');
+  });
+
+  it('printConfig prints a nested mcp.servers snippet headed by the target path, writing nothing', () => {
+    const zcode = getTarget('zcode')!;
+    const before = listAllFiles(tmpHome).concat(listAllFiles(tmpCwd));
+
+    const out = zcode.printConfig('global');
+    expect(out).toContain(path.join(tmpHome, '.zcode', 'cli', 'config.json'));
+    const start = out.indexOf('{');
+    expect(start).toBeGreaterThanOrEqual(0);
+    const snippet = JSON.parse(out.slice(start));
+    expect(snippet.mcp.servers.codegraph.args).toEqual(['serve', '--mcp']);
+    expect(snippet.mcpServers).toBeUndefined();
+
+    const after = listAllFiles(tmpHome).concat(listAllFiles(tmpCwd));
+    expect(after.sort()).toEqual(before.sort());
+  });
+
+  // ---- Front-load prompt hook (UserPromptSubmit, §7.1) ----
+  // ZCode is the second client with a UserPromptSubmit event. Its config
+  // shape is nested (`hooks.enabled` + `hooks.events.<Event>` groups) and
+  // it parses hook stdout as STRICT JSON — hence the `--context-json`
+  // flag in the hook args. User-scope only: workspace hooks are ignored.
+  const globalCfg = () => path.join(tmpHome, '.zcode', 'cli', 'config.json');
+  const readCfg = (): any => JSON.parse(fs.readFileSync(globalCfg(), 'utf-8'));
+  const hookEntries = (cfg: any): any[] =>
+    (cfg.hooks?.events?.UserPromptSubmit ?? []).flatMap((g: any) => g.hooks ?? []);
+  const seedCfg = (cfg: Record<string, any>): void => {
+    fs.mkdirSync(path.dirname(globalCfg()), { recursive: true });
+    fs.writeFileSync(globalCfg(), JSON.stringify(cfg, null, 2) + '\n');
+  };
+
+  it('install with promptHook:true writes the full nested hook structure with enabled:true, keeping sibling mcp intact', () => {
+    const zcode = getTarget('zcode')!;
+    zcode.install('global', { autoAllow: true, promptHook: true });
+
+    const cfg = readCfg();
+    // The MCP entry coexists in the same file.
+    expect(cfg.mcp.servers.codegraph).toBeDefined();
+
+    // hooks.enabled + events.UserPromptSubmit[0].hooks[0] = process hook.
+    expect(cfg.hooks.enabled).toBe(true);
+    const groups = cfg.hooks.events.UserPromptSubmit;
+    expect(Array.isArray(groups)).toBe(true);
+    const entries = hookEntries(cfg);
+    expect(entries).toHaveLength(1);
+    const hook = entries[0];
+    expect(hook.type).toBe('process');
+    // command = the node running the installer; args = [CLI entry js,
+    // prompt-hook, --context-json]. Forward slashes on both.
+    expect(hook.command).toBe(process.execPath.replace(/\\/g, '/'));
+    expect(hook.args).toEqual([resolveZcodeCliEntry(), 'prompt-hook', '--context-json']);
+    // No matcher (meaningless for UserPromptSubmit) and no timeout.
+    expect(groups[0].matcher).toBeUndefined();
+    expect(hook.timeout).toBeUndefined();
+  });
+
+  it('install with promptHook:true is idempotent — re-run is byte-identical and reports unchanged', () => {
+    const zcode = getTarget('zcode')!;
+    zcode.install('global', { autoAllow: true, promptHook: true });
+    const first = fs.readFileSync(globalCfg(), 'utf-8');
+
+    const second = zcode.install('global', { autoAllow: true, promptHook: true });
+
+    expect(fs.readFileSync(globalCfg(), 'utf-8')).toBe(first);
+    for (const f of second.files) expect(f.action).toBe('unchanged');
+    expect(hookEntries(readCfg())).toHaveLength(1);
+  });
+
+  it('install with promptHook:false strips a prior hook but keeps hooks.enabled and the mcp entry', () => {
+    const zcode = getTarget('zcode')!;
+    zcode.install('global', { autoAllow: true, promptHook: true });
+    zcode.install('global', { autoAllow: true, promptHook: false });
+
+    const cfg = readCfg();
+    expect(cfg.hooks.events?.UserPromptSubmit).toBeUndefined();
+    // enabled may serve the user's own hooks — never touched by removal.
+    expect(cfg.hooks.enabled).toBe(true);
+    expect(cfg.mcp.servers.codegraph).toBeDefined();
+  });
+
+  it('install without promptHook (undefined) leaves an existing hook untouched', () => {
+    const zcode = getTarget('zcode')!;
+    zcode.install('global', { autoAllow: true, promptHook: true });
+    const before = fs.readFileSync(globalCfg(), 'utf-8');
+
+    zcode.install('global', { autoAllow: true });
+
+    expect(fs.readFileSync(globalCfg(), 'utf-8')).toBe(before);
+    expect(hookEntries(readCfg())).toHaveLength(1);
+  });
+
+  it("user's own hooks survive install and uninstall; enabled stays true; siblings preserved", () => {
+    const zcode = getTarget('zcode')!;
+    seedCfg({
+      mcp: { servers: { godot: { type: 'stdio', command: 'godot-mcp', args: [] } } },
+      hooks: {
+        enabled: true,
+        events: {
+          UserPromptSubmit: [{ hooks: [{ type: 'process', command: 'my-own-hook', args: ['run'] }] }],
+          Stop: [{ hooks: [{ type: 'process', command: 'user-stop', args: [] }] }],
+        },
+      },
+    });
+
+    zcode.install('global', { autoAllow: true, promptHook: true });
+    let cfg = readCfg();
+    // Only ONE group added; the user's group and the Stop event untouched.
+    expect(cfg.hooks.events.UserPromptSubmit).toHaveLength(2);
+    expect(cfg.hooks.events.UserPromptSubmit[0].hooks[0].command).toBe('my-own-hook');
+    expect(cfg.hooks.events.Stop[0].hooks[0].command).toBe('user-stop');
+    expect(cfg.mcp.servers.godot).toBeDefined();
+
+    zcode.uninstall('global');
+    cfg = readCfg();
+    // Ours is gone, the user's remains, enabled still true, mcp pruned.
+    expect(hookEntries(cfg).map((h: any) => h.command)).toEqual(['my-own-hook']);
+    expect(cfg.hooks.events.Stop[0].hooks[0].command).toBe('user-stop');
+    expect(cfg.hooks.enabled).toBe(true);
+    expect(cfg.mcp.servers.codegraph).toBeUndefined();
+    expect(cfg.mcp.servers.godot).toBeDefined();
+  });
+
+  it('uninstall of a from-scratch install leaves hooks as exactly { enabled: true } (never deleted)', () => {
+    const zcode = getTarget('zcode')!;
+    zcode.install('global', { autoAllow: true, promptHook: true });
+    zcode.uninstall('global');
+    const cfg = readCfg();
+    expect(cfg.mcp).toBeUndefined();
+    expect(cfg.hooks).toEqual({ enabled: true });
+  });
+
+  it('self-heal: an entry from a prior install (different node/entry paths) is updated in place, not duplicated', () => {
+    const zcode = getTarget('zcode')!;
+    seedCfg({
+      hooks: {
+        enabled: true,
+        events: {
+          UserPromptSubmit: [{
+            hooks: [{ type: 'process', command: '/old/node', args: ['/old/codegraph.js', 'prompt-hook', '--context-json'] }],
+          }],
+        },
+      },
+    });
+
+    zcode.install('global', { autoAllow: true, promptHook: true });
+
+    const entries = hookEntries(readCfg());
+    expect(entries).toHaveLength(1);
+    expect(entries[0].command).toBe(process.execPath.replace(/\\/g, '/'));
+    expect(entries[0].args).toEqual([resolveZcodeCliEntry(), 'prompt-hook', '--context-json']);
+  });
+
+  it('local + promptHook:true writes NO hook and notes the user-scope limitation', () => {
+    const zcode = getTarget('zcode')!;
+    const result = zcode.install('local', { autoAllow: true, promptHook: true });
+
+    expect(result.notes?.join(' ')).toMatch(/user-scope only/);
+    expect(result.notes?.join(' ')).toMatch(/--location=global/);
+    const localCfg = JSON.parse(fs.readFileSync(path.join(tmpCwd, '.zcode', 'config.json'), 'utf-8'));
+    expect(localCfg.hooks).toBeUndefined();
+    expect(localCfg.mcp.servers.codegraph).toBeDefined();
+    // The global config was never touched.
+    expect(fs.existsSync(globalCfg())).toBe(false);
+  });
+
+  describe('resolveZcodeCliEntry (hook args[0] derivation)', () => {
+    // Mock package layouts: nested start dir like dist/installer/targets,
+    // package.json at the root — same walk the real __dirname performs.
+    type Layout = { distEntry?: boolean; rootShim?: boolean; scriptShim?: boolean };
+    const makePkg = (label: string, layout: Layout): string => {
+      const root = mkTmpDir(label);
+      fs.writeFileSync(path.join(root, 'package.json'), '{}');
+      if (layout.rootShim) fs.writeFileSync(path.join(root, 'npm-shim.js'), '');
+      if (layout.scriptShim) {
+        fs.mkdirSync(path.join(root, 'scripts'), { recursive: true });
+        fs.writeFileSync(path.join(root, 'scripts', 'npm-shim.js'), '');
+      }
+      if (layout.distEntry) {
+        fs.mkdirSync(path.join(root, 'dist', 'bin'), { recursive: true });
+        fs.writeFileSync(path.join(root, 'dist', 'bin', 'codegraph.js'), '');
+      }
+      const nested = path.join(root, 'dist', 'installer', 'targets');
+      fs.mkdirSync(nested, { recursive: true });
+      return nested;
+    };
+    const rootOf = (nested: string): string =>
+      path.dirname(path.dirname(path.dirname(nested)));
+
+    it('prefers dist/bin/codegraph.js over both shims when present (bundle layout)', () => {
+      const nested = makePkg('zc-entry-dist', { distEntry: true, rootShim: true, scriptShim: true });
+      const root = rootOf(nested);
+      try {
+        expect(resolveZcodeCliEntry(nested))
+          .toBe(path.join(root, 'dist', 'bin', 'codegraph.js').replace(/\\/g, '/'));
+      } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+      }
+    });
+
+    it('falls back to the root npm-shim.js when dist/bin/codegraph.js is absent (npm thin-installer layout)', () => {
+      const nested = makePkg('zc-entry-shim', { rootShim: true, scriptShim: true });
+      const root = rootOf(nested);
+      try {
+        expect(resolveZcodeCliEntry(nested))
+          .toBe(path.join(root, 'npm-shim.js').replace(/\\/g, '/'));
+      } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+      }
+    });
+
+    it('falls back to scripts/npm-shim.js in an unbuilt source checkout (no dist entry, no root shim)', () => {
+      const nested = makePkg('zc-entry-scripts', { scriptShim: true });
+      const root = rootOf(nested);
+      try {
+        expect(resolveZcodeCliEntry(nested))
+          .toBe(path.join(root, 'scripts', 'npm-shim.js').replace(/\\/g, '/'));
+      } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+      }
+    });
+
+    it('returns the last candidate when no entry exists anywhere (pre-existing semantics)', () => {
+      const nested = makePkg('zc-entry-none', {});
+      const root = rootOf(nested);
+      try {
+        expect(resolveZcodeCliEntry(nested))
+          .toBe(path.join(root, 'scripts', 'npm-shim.js').replace(/\\/g, '/'));
+      } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+      }
+    });
+
+    it('always returns forward slashes', () => {
+      const nested = makePkg('zc-entry-fwd', { distEntry: true });
+      const root = rootOf(nested);
+      try {
+        expect(resolveZcodeCliEntry(nested)).not.toContain('\\');
+      } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+      }
+    });
+  });
+
+  describe('resolveZcodeMcpCommand (D1)', () => {
+    // Override process.platform for deterministic tests regardless of the
+    // host OS. Restored in finally so no other test is affected.
+    function withPlatform(platform: string, fn: () => void): void {
+      const desc = Object.getOwnPropertyDescriptor(process, 'platform');
+      Object.defineProperty(process, 'platform', { value: platform, configurable: true });
+      try {
+        fn();
+      } finally {
+        if (desc) Object.defineProperty(process, 'platform', desc);
+      }
+    }
+
+    it('non-win32 returns the bare command name', () => {
+      withPlatform('linux', () => {
+        expect(resolveZcodeMcpCommand()).toBe('codegraph');
+      });
+    });
+
+    it('win32 returns the absolute path when codegraph.cmd is found on PATH', () => {
+      withPlatform('win32', () => {
+        const binDir = mkTmpDir('zc-bin');
+        fs.writeFileSync(path.join(binDir, 'codegraph.cmd'), '');
+        const prevPath = process.env.PATH;
+        process.env.PATH = binDir;
+        try {
+          // Forward-slash form: matches hand-written entries (jsonDeepEqual
+          // compares strings, so separator style decides unchanged-vs-updated).
+          expect(resolveZcodeMcpCommand()).toBe(path.join(binDir, 'codegraph.cmd').replace(/\\/g, '/'));
+        } finally {
+          process.env.PATH = prevPath;
+          fs.rmSync(binDir, { recursive: true, force: true });
+        }
+      });
+    });
+
+    it('win32 falls back to codegraph.cmd when not found on PATH', () => {
+      withPlatform('win32', () => {
+        const emptyDir = mkTmpDir('zc-empty');
+        const prevPath = process.env.PATH;
+        process.env.PATH = emptyDir;
+        try {
+          expect(resolveZcodeMcpCommand()).toBe('codegraph.cmd');
+        } finally {
+          process.env.PATH = prevPath;
+          fs.rmSync(emptyDir, { recursive: true, force: true });
+        }
+      });
+    });
+
+    it('win32: install over a pre-existing hand-written forward-slash entry reports unchanged', () => {
+      withPlatform('win32', () => {
+        const binDir = mkTmpDir('zc-hand');
+        fs.writeFileSync(path.join(binDir, 'codegraph.cmd'), '');
+        const prevPath = process.env.PATH;
+        process.env.PATH = binDir;
+        try {
+          const zcode = getTarget('zcode')!;
+          const cfgFile = path.join(tmpHome, '.zcode', 'cli', 'config.json');
+          fs.mkdirSync(path.dirname(cfgFile), { recursive: true });
+          // The hand-written form this machine already has: forward-slash
+          // absolute command, no `enabled` field (D5). First run must be a
+          // no-op (acceptance: "对现有手动条目执行后报 unchanged").
+          fs.writeFileSync(cfgFile, JSON.stringify({
+            mcp: { servers: { codegraph: {
+              type: 'stdio',
+              command: path.join(binDir, 'codegraph.cmd').replace(/\\/g, '/'),
+              args: ['serve', '--mcp'],
+            } } },
+          }, null, 2) + '\n');
+
+          const result = zcode.install('global', { autoAllow: true });
+          const cfgEntry = result.files.find((f) => f.path === cfgFile);
+          expect(cfgEntry?.action).toBe('unchanged');
+          // Nothing was rewritten — still no `enabled` key.
+          const onDisk = JSON.parse(fs.readFileSync(cfgFile, 'utf-8'));
+          expect(onDisk.mcp.servers.codegraph.enabled).toBeUndefined();
+          expect(onDisk.mcp.servers.codegraph.command).toBe(path.join(binDir, 'codegraph.cmd').replace(/\\/g, '/'));
+        } finally {
+          process.env.PATH = prevPath;
+          fs.rmSync(binDir, { recursive: true, force: true });
+        }
+      });
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// prompt-hook --context-json output envelope (§7.1).
+//
+// ZCode parses a UserPromptSubmit hook's stdout as STRICT JSON — a raw
+// text payload only reaches the log. The `--context-json` flag wraps the
+// exact text the hook would print in the documented hookSpecificOutput
+// envelope; without it the text goes out verbatim for Claude Code. The
+// wrapper lives in its own module (bin/codegraph.ts runs program.parse()
+// at import time, so it can't be imported into a test).
+// ---------------------------------------------------------------------------
+describe('prompt-hook --context-json envelope', () => {
+  it('without the flag, text is returned verbatim', () => {
+    expect(wrapPromptHookOutput('<codegraph_context>…</codegraph_context>\n', false))
+      .toBe('<codegraph_context>…</codegraph_context>\n');
+  });
+
+  it('with the flag, text is wrapped in the UserPromptSubmit hookSpecificOutput envelope + newline', () => {
+    const text = 'ctx line 1\nctx line 2\n';
+    const out = wrapPromptHookOutput(text, true);
+    expect(out.endsWith('\n')).toBe(true);
+    expect(() => JSON.parse(out)).not.toThrow(); // strict-JSON parseable
+    const parsed = JSON.parse(out);
+    expect(parsed.hookSpecificOutput.hookEventName).toBe('UserPromptSubmit');
+    expect(parsed.hookSpecificOutput.additionalContext).toBe(text);
+  });
+
+  it('escapes quotes/backslashes/newlines in the text instead of breaking the JSON', () => {
+    const text = 'a "quoted" \\" token \\ and\nnewline';
+    const parsed = JSON.parse(wrapPromptHookOutput(text, true));
+    expect(parsed.hookSpecificOutput.additionalContext).toBe(text);
   });
 });

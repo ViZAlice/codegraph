@@ -36,6 +36,7 @@ Follow [@getcodegraph](https://x.com/getcodegraph) on X for updates.
 [![Antigravity](https://img.shields.io/badge/Antigravity-supported-blueviolet.svg)](#supported-agents)
 [![Kiro](https://img.shields.io/badge/Kiro-supported-blueviolet.svg)](#supported-agents)
 [![GitHub Copilot](https://img.shields.io/badge/GitHub_Copilot-supported-blueviolet.svg)](#supported-agents)
+[![ZCode](https://img.shields.io/badge/ZCode-supported-blueviolet.svg)](#supported-agents)
 
 <br>
 
@@ -764,6 +765,7 @@ is written):
 - **Antigravity IDE**
 - **Kiro**
 - **GitHub Copilot** — Copilot Chat in VS Code (`copilot-vscode`), the Copilot CLI (`copilot-cli`), and the Copilot plugin in JetBrains IDEs (`copilot-jetbrains`)
+- **ZCode**
 
 ## Supported Languages
 
