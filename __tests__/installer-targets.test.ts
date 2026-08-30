@@ -24,6 +24,7 @@ import { uninstallTargets, refreshTargets } from '../src/installer';
 import { upsertTomlTable, removeTomlTable, buildTomlTable } from '../src/installer/targets/toml';
 import { cleanupLegacyHooks, writePromptHookEntry, removePromptHookEntry } from '../src/installer/targets/claude';
 import { resolveZcodeMcpCommand, resolveZcodeCliEntry } from '../src/installer/targets/zcode';
+import { resolveCodegraphCliEntry } from '../src/installer/targets/shared';
 import { wrapPromptHookOutput } from '../src/prompt-hook-output';
 
 function mkTmpDir(label: string): string {
@@ -42,6 +43,7 @@ function setHome(dir: string): { restore: () => void } {
     XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME,
     HERMES_HOME: process.env.HERMES_HOME,
     COPILOT_HOME: process.env.COPILOT_HOME,
+    DSH_HOME: process.env.DSH_HOME,
   };
   process.env.HOME = dir;
   process.env.USERPROFILE = dir;
@@ -49,6 +51,7 @@ function setHome(dir: string): { restore: () => void } {
   process.env.XDG_CONFIG_HOME = path.join(dir, '.config');
   delete process.env.HERMES_HOME;
   delete process.env.COPILOT_HOME;
+  delete process.env.DSH_HOME;
   return {
     restore() {
       if (prev.HOME === undefined) delete process.env.HOME; else process.env.HOME = prev.HOME;
@@ -57,6 +60,7 @@ function setHome(dir: string): { restore: () => void } {
       if (prev.XDG_CONFIG_HOME === undefined) delete process.env.XDG_CONFIG_HOME; else process.env.XDG_CONFIG_HOME = prev.XDG_CONFIG_HOME;
       if (prev.HERMES_HOME === undefined) delete process.env.HERMES_HOME; else process.env.HERMES_HOME = prev.HERMES_HOME;
       if (prev.COPILOT_HOME === undefined) delete process.env.COPILOT_HOME; else process.env.COPILOT_HOME = prev.COPILOT_HOME;
+      if (prev.DSH_HOME === undefined) delete process.env.DSH_HOME; else process.env.DSH_HOME = prev.DSH_HOME;
     },
   };
 }
@@ -3067,6 +3071,311 @@ describe('Installer targets — ZCode', () => {
         }
       });
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// DeepSeek Harness (dsh) — a Cordis plugin harness with no config keys:
+// everything is an `- insert:` plugin line in ~/.dsh/cordis.patch.yml.
+// Two independent marker blocks (mcp / CC-hooks bridge), ~/.dsh/AGENTS.md,
+// an exclusive codegraph-hooks.json, DSH_HOME override, global-only, and
+// a BARE `codegraph` command (dsh spawns through cross-spawn, which does
+// its own Windows PATHEXT resolution — the ZCode .cmd-scan does not apply).
+// ---------------------------------------------------------------------------
+describe('Installer targets — DeepSeek Harness (dsh)', () => {
+  let tmpHome: string;
+  let tmpCwd: string;
+  let origCwd: string;
+  let homeRestore: { restore: () => void };
+
+  beforeEach(() => {
+    tmpHome = mkTmpDir('dsh-home');
+    tmpCwd = mkTmpDir('dsh-cwd');
+    origCwd = process.cwd();
+    process.chdir(tmpCwd);
+    homeRestore = setHome(tmpHome);
+  });
+
+  afterEach(() => {
+    homeRestore.restore();
+    process.chdir(origCwd);
+    fs.rmSync(tmpHome, { recursive: true, force: true });
+    fs.rmSync(tmpCwd, { recursive: true, force: true });
+  });
+
+  const patchYml = () => path.join(tmpHome, '.dsh', 'cordis.patch.yml');
+  const hooksJson = () => path.join(tmpHome, '.dsh', 'codegraph-hooks.json');
+  const agentsMd = () => path.join(tmpHome, '.dsh', 'AGENTS.md');
+  const readPatch = () => fs.readFileSync(patchYml(), 'utf-8');
+  const seedPatch = (body: string): void => {
+    fs.mkdirSync(path.dirname(patchYml()), { recursive: true });
+    fs.writeFileSync(patchYml(), body);
+  };
+
+  it('first install writes the mcp insert block + AGENTS.md; re-run is all unchanged', () => {
+    const dsh = getTarget('dsh')!;
+    const result = dsh.install('global', { autoAllow: true });
+
+    const patchEntry = result.files.find((f) => f.path === patchYml());
+    expect(patchEntry?.action).toBe('created');
+    expect(result.files.some((f) => f.path === agentsMd())).toBe(true);
+
+    const body = readPatch();
+    expect(body).toContain('# >>> codegraph mcp >>>');
+    expect(body).toContain('# <<< codegraph mcp <<<');
+    expect(body).toContain('- id: mcp-codegraph');
+    expect(body).toContain("name: '@deepseek-ai/dsh-mcp-client'");
+    expect(body).toContain('transport: stdio');
+    expect(body).toContain('serverName: codegraph');
+    // Bare command — cross-spawn resolves PATHEXT (NOT the ZCode .cmd form).
+    expect(body).toContain('command: codegraph');
+    expect(body).not.toContain('codegraph.cmd');
+    expect(body).toContain("args: ['serve', '--mcp']");
+    // No default-valued schema fields written (minimal clobber surface).
+    expect(body).not.toContain('toolCallTimeoutMs');
+    expect(body).not.toContain('failOnStartupError');
+    expect(body).not.toContain('reconnect');
+    // promptHook undefined → no bridge block, no hooks.json.
+    expect(body).not.toContain('codegraph hooks');
+    expect(fs.existsSync(hooksJson())).toBe(false);
+
+    expect(fs.readFileSync(agentsMd(), 'utf-8')).toContain('codegraph explore');
+
+    // Hot-reload note, never a restart wording.
+    expect(result.notes?.join(' ')).toMatch(/hot-reload/i);
+    expect(result.notes?.join(' ')).not.toMatch(/restart/i);
+
+    const second = dsh.install('global', { autoAllow: true });
+    for (const f of second.files) expect(f.action).toBe('unchanged');
+    expect(readPatch()).toBe(body);
+  });
+
+  it('install with promptHook:true adds the bridge trio (block + hooks.json) alongside mcp', () => {
+    const dsh = getTarget('dsh')!;
+    const result = dsh.install('global', { autoAllow: true, promptHook: true });
+
+    // Patch file created ONCE for both blocks.
+    const patchEntries = result.files.filter((f) => f.path === patchYml());
+    expect(patchEntries).toHaveLength(1);
+    expect(patchEntries[0].action).toBe('created');
+
+    const body = readPatch();
+    expect(body).toContain('# >>> codegraph hooks >>>');
+    expect(body).toContain('- id: hooks-claude-code-codegraph');
+    expect(body).toContain("name: '@deepseek-ai/dsh-hooks-claude-code'");
+    // configPath: absolute, forward slashes, points at our exclusive file.
+    const cfgLine = body.split('\n').find((l) => l.includes('configPath:'))!;
+    expect(cfgLine).toBe(`        configPath: '${hooksJson().replace(/\\/g, '/')}'`);
+    // Both marker pairs present, each exactly once.
+    expect(body.split('# >>> codegraph hooks >>>').length - 1).toBe(1);
+    expect(body.split('# >>> codegraph mcp >>>').length - 1).toBe(1);
+
+    // hooks.json: the CC settings shape the bridge parses.
+    expect(result.files.some((f) => f.path === hooksJson() && f.action === 'created')).toBe(true);
+    const cfg = JSON.parse(fs.readFileSync(hooksJson(), 'utf-8'));
+    const hook = cfg.hooks.UserPromptSubmit[0].hooks[0];
+    expect(hook.type).toBe('command');
+    // pwsh-safe command string: double-quoted absolute node (install-time
+    // process.execPath — no PATH dependency) + double-quoted absolute entry
+    // with forward slashes + the strict-JSON envelope flag.
+    expect(hook.command).toBe(`"${process.execPath.replace(/\\/g, '/')}" "${resolveCodegraphCliEntry()}" prompt-hook --context-json`);
+    expect(hook.command).not.toContain('\\');
+
+    // Idempotent re-run: every surface unchanged, byte-equal.
+    const first = body + fs.readFileSync(hooksJson(), 'utf-8');
+    const second = dsh.install('global', { autoAllow: true, promptHook: true });
+    for (const f of second.files) expect(f.action).toBe('unchanged');
+    expect(readPatch() + fs.readFileSync(hooksJson(), 'utf-8')).toBe(first);
+  });
+
+  it('install with promptHook:false strips a prior bridge trio; opt-out round-trips', () => {
+    const dsh = getTarget('dsh')!;
+    dsh.install('global', { autoAllow: true, promptHook: true });
+
+    const result = dsh.install('global', { autoAllow: true, promptHook: false });
+
+    expect(result.files.find((f) => f.path === hooksJson())?.action).toBe('removed');
+    expect(fs.existsSync(hooksJson())).toBe(false);
+    const body = readPatch();
+    expect(body).not.toContain('codegraph hooks');
+    expect(body).toContain('# >>> codegraph mcp >>>'); // the mcp block stays
+    // One combined entry for the patch file, reported as updated.
+    expect(result.files.filter((f) => f.path === patchYml())).toHaveLength(1);
+    expect(result.files.find((f) => f.path === patchYml())?.action).toBe('updated');
+  });
+
+  it('install without promptHook (undefined) leaves an existing bridge trio untouched', () => {
+    const dsh = getTarget('dsh')!;
+    dsh.install('global', { autoAllow: true, promptHook: true });
+    const before = readPatch() + fs.readFileSync(hooksJson(), 'utf-8');
+
+    const result = dsh.install('global', { autoAllow: true });
+
+    expect(readPatch() + fs.readFileSync(hooksJson(), 'utf-8')).toBe(before);
+    // The hooks file is not even reported.
+    expect(result.files.some((f) => f.path === hooksJson())).toBe(false);
+  });
+
+  it('self-heal: stale content inside the mcp markers is rewritten in place (command 自愈)', () => {
+    const dsh = getTarget('dsh')!;
+    seedPatch([
+      '- insert:',
+      '    - id: user-plugin',
+      "      name: '@deepseek-ai/dsh-theme'",
+      '',
+      '# >>> codegraph mcp >>>',
+      '- insert:',
+      '    - id: mcp-codegraph',
+      "      name: '@deepseek-ai/dsh-mcp-client'",
+      '      config:',
+      '        transport: stdio',
+      '        serverName: codegraph',
+      '        command: codegraph-old',
+      "        args: ['serve']",
+      '# <<< codegraph mcp <<<',
+      '',
+    ].join('\n'));
+
+    const result = dsh.install('global', { autoAllow: true });
+
+    expect(result.files.find((f) => f.path === patchYml())?.action).toBe('updated');
+    const body = readPatch();
+    expect(body).toContain('command: codegraph\n');
+    expect(body).not.toContain('codegraph-old');
+    expect(body).toContain("args: ['serve', '--mcp']");
+    // Exactly one mcp block — swapped, not duplicated.
+    expect(body.split('# >>> codegraph mcp >>>').length - 1).toBe(1);
+    // The user's sibling insert line above the block survived.
+    expect(body).toContain('- id: user-plugin');
+  });
+
+  it('sibling patch lines survive install AND uninstall; the file is kept when non-empty', () => {
+    const dsh = getTarget('dsh')!;
+    seedPatch([
+      '# my own patch lines',
+      '- insert:',
+      '    - id: user-plugin',
+      "      name: '@deepseek-ai/dsh-theme'",
+      '',
+    ].join('\n'));
+
+    dsh.install('global', { autoAllow: true, promptHook: true });
+
+    let body = readPatch();
+    expect(body).toContain('# my own patch lines');
+    expect(body).toContain('- id: user-plugin');
+
+    dsh.uninstall('global');
+
+    body = readPatch();
+    expect(body).toContain('# my own patch lines');
+    expect(body).toContain('- id: user-plugin');
+    expect(body).not.toContain('codegraph mcp');
+    expect(body).not.toContain('codegraph hooks');
+    expect(fs.existsSync(patchYml())).toBe(true); // siblings keep the file alive
+  });
+
+  it('uninstall round-trip from scratch deletes the emptied patch file, AGENTS.md, and hooks.json', () => {
+    const dsh = getTarget('dsh')!;
+    dsh.install('global', { autoAllow: true, promptHook: true });
+    expect(dsh.detect('global').alreadyConfigured).toBe(true);
+
+    const result = dsh.uninstall('global');
+
+    expect(result.files.find((f) => f.path === patchYml())?.action).toBe('removed');
+    expect(result.files.find((f) => f.path === hooksJson())?.action).toBe('removed');
+    expect(fs.existsSync(patchYml())).toBe(false);
+    expect(fs.existsSync(hooksJson())).toBe(false);
+    expect(fs.existsSync(agentsMd())).toBe(false);
+    expect(dsh.detect('global').alreadyConfigured).toBe(false);
+  });
+
+  it('AGENTS.md user content survives install; uninstall strips only the marker block', () => {
+    const dsh = getTarget('dsh')!;
+    fs.mkdirSync(path.dirname(agentsMd()), { recursive: true });
+    fs.writeFileSync(agentsMd(), `# My dsh notes\n\nBe terse.\n\n${LEGACY_BLOCK}\n`);
+
+    dsh.install('global', { autoAllow: true });
+
+    let body = fs.readFileSync(agentsMd(), 'utf-8');
+    expect(body).toContain('# My dsh notes');
+    expect(body).toContain('Be terse.');
+    expect(body).not.toContain('Prefer `codegraph_search`'); // stale block self-healed
+    expect(body).toContain('codegraph explore');
+
+    dsh.uninstall('global');
+
+    body = fs.readFileSync(agentsMd(), 'utf-8');
+    expect(body).toContain('# My dsh notes');
+    expect(body).toContain('Be terse.');
+    expect(body).not.toContain('CODEGRAPH_START');
+    expect(body).not.toContain('codegraph explore');
+  });
+
+  it('local install skips with a note and writes nothing', () => {
+    const dsh = getTarget('dsh')!;
+    expect(dsh.supportsLocation('local')).toBe(false);
+
+    const result = dsh.install('local', { autoAllow: true });
+
+    expect(result.files).toHaveLength(0);
+    expect(result.notes?.join(' ')).toMatch(/--location=global/);
+    expect(fs.existsSync(path.join(tmpHome, '.dsh'))).toBe(false);
+    expect(fs.existsSync(path.join(tmpCwd, '.dsh'))).toBe(false);
+  });
+
+  it('DSH_HOME overrides the home directory (HERMES_HOME precedent)', () => {
+    const dsh = getTarget('dsh')!;
+    const altHome = mkTmpDir('dsh-alt');
+    process.env.DSH_HOME = altHome;
+    try {
+      dsh.install('global', { autoAllow: true, promptHook: true });
+
+      expect(fs.existsSync(path.join(altHome, 'cordis.patch.yml'))).toBe(true);
+      expect(fs.existsSync(path.join(altHome, 'codegraph-hooks.json'))).toBe(true);
+      expect(fs.existsSync(path.join(altHome, 'AGENTS.md'))).toBe(true);
+      // The real (tmp) home was never touched.
+      expect(fs.existsSync(path.join(tmpHome, '.dsh'))).toBe(false);
+      // detect honors the override too.
+      expect(dsh.detect('global').configPath).toBe(path.join(altHome, 'cordis.patch.yml'));
+    } finally {
+      delete process.env.DSH_HOME;
+      fs.rmSync(altHome, { recursive: true, force: true });
+    }
+  });
+
+  it('detect three states: absent → installed (profiles/) → alreadyConfigured (mcp line)', () => {
+    const dsh = getTarget('dsh')!;
+    // Nothing on the machine.
+    expect(dsh.detect('global')).toMatchObject({ installed: false, alreadyConfigured: false });
+
+    // dsh has run (profiles/ exists) but codegraph is not wired.
+    fs.mkdirSync(path.join(tmpHome, '.dsh', 'profiles'), { recursive: true });
+    expect(dsh.detect('global')).toMatchObject({ installed: true, alreadyConfigured: false });
+
+    // A patch line with our plugin id — alreadyConfigured, with or without
+    // the marker block around it.
+    seedPatch('- insert:\n    - id: mcp-codegraph\n');
+    expect(dsh.detect('global').alreadyConfigured).toBe(true);
+
+    // Sibling-only patch content keeps it honest.
+    seedPatch('- insert:\n    - id: other\n');
+    expect(dsh.detect('global').alreadyConfigured).toBe(false);
+  });
+
+  it('printConfig prints the mcp insert block headed by the patch path, writing nothing', () => {
+    const dsh = getTarget('dsh')!;
+    const before = listAllFiles(tmpHome).concat(listAllFiles(tmpCwd));
+
+    const out = dsh.printConfig('global');
+
+    expect(out).toContain(patchYml());
+    expect(out).toContain('# >>> codegraph mcp >>>');
+    expect(out).toContain('- id: mcp-codegraph');
+    expect(out).toContain('serverName: codegraph');
+    // No filesystem writes.
+    const after = listAllFiles(tmpHome).concat(listAllFiles(tmpCwd));
+    expect(after.sort()).toEqual(before.sort());
   });
 });
 

@@ -52,6 +52,7 @@ import {
   jsonDeepEqual,
   readJsonFile,
   removeMarkedSection,
+  resolveCodegraphCliEntry,
   writeJsonFile,
   upsertInstructionsEntry,
 } from './shared';
@@ -119,47 +120,13 @@ function buildZcodeMcpConfig(): { type: string; command: string; args: string[] 
 }
 
 /**
- * Resolve the absolute CLI-entry JS used as `args[0]` of the ZCode prompt
- * hook (§7.1).
- *
- * The hook's `command` is `process.execPath` (the node running the
- * installer — zero PATH dependency, sidestepping the win32 `.cmd`-shim
- * class of spawn failure entirely), so `args[0]` must be the CLI's
- * ENTRY SCRIPT, not a bare `codegraph`. Derived at install time from
- * `__dirname`: walk up to the first ancestor holding a package.json (the
- * package root), then try candidates in order:
- *   1. `<root>/dist/bin/codegraph.js` — source / bundle layout, a real
- *      compiled CLI.
- *   2. `<root>/npm-shim.js` — the npm thin-installer layout, where dist
- *      holds only .d.ts and the bin is the shim (verified to forward
- *      argv).
- *   3. `<root>/scripts/npm-shim.js` — an UNBUILT source checkout, where
- *      the shim lives under `scripts/` and dist may not exist yet.
- * When none exists the last candidate is returned (pre-existing
- * behavior — the entry self-heals on the next install once built).
- *
- * Forward slashes regardless of platform: same convention as D1, and it
- * keeps `jsonDeepEqual` idempotency stable across reinstalls. Exported
- * with a `startDir` parameter so the layout walk can be unit-tested
- * against synthetic package trees.
+ * Historical alias for the CLI-entry derivation now lifted into
+ * `shared.ts` (the dsh target's hooks.json needs the same walk).
+ * Re-exported under the old name so existing imports — and the unit
+ * tests that pin the layout walk — keep working unchanged. See
+ * `resolveCodegraphCliEntry` in shared.ts for the rationale.
  */
-export function resolveZcodeCliEntry(startDir: string = __dirname): string {
-  let dir = path.resolve(startDir);
-  for (;;) {
-    if (fs.existsSync(path.join(dir, 'package.json'))) break;
-    const parent = path.dirname(dir);
-    if (parent === dir) break; // reached the filesystem root — stop climbing
-    dir = parent;
-  }
-  const candidates = [
-    path.join(dir, 'dist', 'bin', 'codegraph.js'),
-    path.join(dir, 'npm-shim.js'),
-    path.join(dir, 'scripts', 'npm-shim.js'),
-  ];
-  const last = candidates[candidates.length - 1]!;
-  const entry = candidates.find((c) => fs.existsSync(c)) ?? last;
-  return entry.replace(/\\/g, '/');
-}
+export { resolveCodegraphCliEntry as resolveZcodeCliEntry };
 
 /**
  * The ZCode prompt hook the installer writes (see
@@ -172,7 +139,7 @@ export function buildZcodePromptHook(): { type: string; command: string; args: s
   return {
     type: 'process',
     command: process.execPath.replace(/\\/g, '/'),
-    args: [resolveZcodeCliEntry(), 'prompt-hook', '--context-json'],
+    args: [resolveCodegraphCliEntry(), 'prompt-hook', '--context-json'],
   };
 }
 

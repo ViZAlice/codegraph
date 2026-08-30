@@ -128,6 +128,54 @@ export function jsonDeepEqual(a: unknown, b: unknown): boolean {
 }
 
 /**
+ * Resolve the absolute CLI-entry JS used as the entry argument of the
+ * prompt hooks the installer writes (ZCode args[0], dsh's pwsh command
+ * string).
+ *
+ * Lifted verbatim from `zcode.ts` (`resolveZcodeCliEntry`, §7.1) when the
+ * dsh target needed the same derivation — zcode.ts re-exports it under its
+ * historical name so existing imports (and tests) keep working.
+ *
+ * The hook's `command` is a node interpreter (the node running the
+ * installer — zero PATH dependency, sidestepping the win32 `.cmd`-shim
+ * class of spawn failure entirely), so the entry must be the CLI's
+ * ENTRY SCRIPT, not a bare `codegraph`. Derived at install time from
+ * `__dirname`: walk up to the first ancestor holding a package.json (the
+ * package root), then try candidates in order:
+ *   1. `<root>/dist/bin/codegraph.js` — source / bundle layout, a real
+ *      compiled CLI.
+ *   2. `<root>/npm-shim.js` — the npm thin-installer layout, where dist
+ *      holds only .d.ts and the bin is the shim (verified to forward
+ *      argv).
+ *   3. `<root>/scripts/npm-shim.js` — an UNBUILT source checkout, where
+ *      the shim lives under `scripts/` and dist may not exist yet.
+ * When none exists the last candidate is returned (pre-existing
+ * behavior — the entry self-heals on the next install once built).
+ *
+ * Forward slashes regardless of platform: keeps idempotency comparisons
+ * byte-stable across reinstalls and keeps the path safe to embed in
+ * quoted shell command strings. Exported with a `startDir` parameter so
+ * the layout walk can be unit-tested against synthetic package trees.
+ */
+export function resolveCodegraphCliEntry(startDir: string = __dirname): string {
+  let dir = path.resolve(startDir);
+  for (;;) {
+    if (fs.existsSync(path.join(dir, 'package.json'))) break;
+    const parent = path.dirname(dir);
+    if (parent === dir) break; // reached the filesystem root — stop climbing
+    dir = parent;
+  }
+  const candidates = [
+    path.join(dir, 'dist', 'bin', 'codegraph.js'),
+    path.join(dir, 'npm-shim.js'),
+    path.join(dir, 'scripts', 'npm-shim.js'),
+  ];
+  const last = candidates[candidates.length - 1]!;
+  const entry = candidates.find((c) => fs.existsSync(c)) ?? last;
+  return entry.replace(/\\/g, '/');
+}
+
+/**
  * Replace or append a marker-delimited section in a markdown-ish file.
  *
  * Used by Claude / Codex for the `<!-- CODEGRAPH_START --> ... <!--

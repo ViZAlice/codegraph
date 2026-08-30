@@ -766,6 +766,7 @@ is written):
 - **Kiro**
 - **GitHub Copilot** — Copilot Chat in VS Code (`copilot-vscode`), the Copilot CLI (`copilot-cli`), and the Copilot plugin in JetBrains IDEs (`copilot-jetbrains`)
 - **ZCode**
+- **DeepSeek Harness (dsh)****
 
 ## Supported Languages
 
