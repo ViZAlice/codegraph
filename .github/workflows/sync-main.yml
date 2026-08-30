@@ -1,0 +1,44 @@
+name: Sync main from upstream
+
+# Keep the fork's `main` a pure fast-forward mirror of upstream
+# (colbymchenry/codegraph). Runs daily on GitHub's runners — no local
+# machine involved. It NEVER touches feat/agent-targets; pulling upstream
+# changes into the maintained branch stays a deliberate, manual merge
+# (see docs/FORK_WORKFLOW.md).
+#
+# NOTE: GitHub fires `schedule` only for workflows on the DEFAULT branch,
+# so this fork's default branch is feat/agent-targets — which carries this
+# file — while `main` stays the auto-synced mirror.
+
+on:
+  schedule:
+    - cron: '0 2 * * *' # 02:00 UTC = 10:00 Beijing
+  workflow_dispatch: {} # allow a manual run from the Actions tab
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-main
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    # Guard: never run on the upstream repo itself.
+    if: github.repository == 'ViZAlice/codegraph'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Fast-forward main to upstream/main
+        run: |
+          git remote add upstream https://github.com/colbymchenry/codegraph.git
+          git fetch upstream main
+          git merge --ff-only FETCH_HEAD
+          git push origin HEAD:main
+
+      - name: Report new commits
+        run: git log -1 --oneline $GITHUB_SHA
