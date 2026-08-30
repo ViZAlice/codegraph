@@ -31,7 +31,12 @@ import { spawnSync } from 'child_process';
 import { ansiColorsEnabled } from '../ui/color';
 
 export const REPO = 'colbymchenry/codegraph';
-export const NPM_PACKAGE = '@colbymchenry/codegraph';
+// Fork package, NOT upstream's: `codegraph upgrade` on an npm install must
+// upgrade within this fork's line — pointing it at @colbymchenry would
+// silently replace the fork build (zcode/dsh targets) with upstream's.
+// REPO stays upstream: the bundle-upgrade path only ever runs on upstream
+// bundle installs, whose releases live there.
+export const NPM_PACKAGE = '@vizalice/codegraph';
 const RAW_BASE = `https://raw.githubusercontent.com/${REPO}/main`;
 export const INSTALL_SH_URL = `${RAW_BASE}/install.sh`;
 

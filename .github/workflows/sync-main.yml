@@ -4,7 +4,7 @@ name: Sync main from upstream
 # (colbymchenry/codegraph). Runs daily on GitHub's runners — no local
 # machine involved. It NEVER touches feat/agent-targets; pulling upstream
 # changes into the maintained branch stays a deliberate, manual merge
-# (see docs/FORK_WORKFLOW.md).
+# (see AGENTS.md at repo root).
 #
 # NOTE: GitHub fires `schedule` only for workflows on the DEFAULT branch,
 # so this fork's default branch is feat/agent-targets — which carries this

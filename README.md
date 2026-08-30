@@ -75,28 +75,15 @@ Follow [@getcodegraph](https://x.com/getcodegraph) on X for updates.
 
 ### 1. Install the CLI
 
-**No Node.js required** — one command grabs the right build for your OS:
-
 ```bash
-# macOS / Linux
-curl -fsSL https://raw.githubusercontent.com/colbymchenry/codegraph/main/install.sh | sh
-
-# Windows (PowerShell)
-irm https://raw.githubusercontent.com/colbymchenry/codegraph/main/install.ps1 | iex
+npm i -g @vizalice/codegraph
 ```
 
-<details>
-<summary><b>Already have Node? Use npm instead (works on any version)</b></summary>
+<sub>Works on any Node version — nothing to compile, no native build. The installer puts `codegraph` on your PATH but **doesn't change your current shell** — open a new terminal before the next step so the command resolves.</sub>
 
-```bash
-npm i -g @colbymchenry/codegraph
-```
+<sub>**Fork note:** this fork adds agent targets (ZCode, DeepSeek Harness) on top of upstream and ships **via npm only**. The upstream one-line bundle installer (`curl … colbymchenry/codegraph …/install.sh`) installs the **upstream** build, which lacks those targets — don't mix the two.</sub>
 
-<sub>CodeGraph bundles its own runtime — nothing to compile, no native build, works the same everywhere. The installer puts `codegraph` on your PATH but **doesn't change your current shell** — open a new terminal before the next step so the command resolves.</sub>
-
-<sub>**Upgrade any time** with `codegraph upgrade` — it detects how you installed (bundle, npm, or npx) and updates in place. Add `--check` to see if an update is available, or `codegraph upgrade <version>` to pin one.</sub>
-
-</details>
+<sub>**Upgrade any time** with `codegraph upgrade` — on an npm install it upgrades within this fork's package. Add `--check` to see if an update is available, or `codegraph upgrade <version>` to pin one.</sub>
 
 ### 2. Wire up your agent(s)
 

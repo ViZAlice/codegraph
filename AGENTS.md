@@ -21,6 +21,13 @@
 3. 不用 `git push --follow-tags`（它会把 fetch 带来的上游 `v*` tag 一起推上去，触发意外发布）。
 4. 不改 package.json `name` 的 scope；不在 main 上做任何提交（会破坏 sync 的 `--ff-only`）。
 
+## 命名空间策略（合并上游时必查）
+
+- **功能性包名引用必须用 `@vizalice/codegraph`**：`src/upgrade/index.ts` 的 `NPM_PACKAGE`（否则 `codegraph upgrade` 会把我们的 npm 安装静默替换成上游构建）、`src/installer/index.ts` 里的 `npm install -g` / 卸载提示、`src/bin/codegraph.ts` 的报错提示、README 安装命令、package.json `repository`。
+- **上游分发链路保持指向上游，故意不改**：`install.sh` / `install.ps1` / `npm-shim.js` / `src/upgrade/index.ts` 的 `REPO` 常量——它们分发的是上游 bundle（不含 fork 的 target），我们的唯一分发渠道是 npm 包。README 里已注明 bundle 安装器装的是上游构建。
+- `claude.ts` 里对 `npx @colbymchenry/codegraph …` 旧格式的识别注释是**上游遗留产物的清理逻辑**，保持原样。
+- 合并上游后 `git diff` 审一遍这几处；上游若新增强制性包名引用，同样按本策略改。
+
 ## 每日上游同步（自动，无需人工）
 
 `.github/workflows/sync-main.yml`：每天北京时间 10:00 在 GitHub 服务器上把 fork 的 main `--ff-only` 快进到 `upstream/main`，**只动 main**。是否把更新合入 feat/agent-targets 永远是人为决定（见下节）。注意：fork 的 schedule workflow 默认被 GitHub 禁用，需在 Actions 页对该 workflow 点一次 Enable。
