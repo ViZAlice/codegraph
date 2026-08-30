@@ -2,7 +2,10 @@ name: Publish to npm
 
 on:
   push:
-    tags: ['v*']
+    # npm-v* (not v*) so upstream's release tags (v1.6.0, …), which
+    # `git fetch upstream` brings into this clone, can never trigger a
+    # publish or collide with our own release tags.
+    tags: ['npm-v*']
 
 jobs:
   publish:
